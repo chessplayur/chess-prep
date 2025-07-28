@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Chess Opening Analyzer</title>
+<style>
+  body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
+  input, select, button { padding: 8px; font-size: 16px; margin-top: 10px; }
+  button { cursor: pointer; margin-right: 10px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 20px; background: #fff; }
+  th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+  th { background: #eee; }
+  h2 { margin-top: 40px; }
+  #results { margin-top: 20px; }
+  #loading { font-weight: bold; margin-top: 20px; }
+</style>
+</head>
+<body>
+
+<h1>Chess Opening Analyzer</h1>
+
+<label>Choose platform:</label><br/>
+<select id="platform">
+  <option value="lichess" selected>Lichess</option>
+  <option value="chesscom">Chess.com</option>
+</select>
+
+<p>Enter username:</p>
+<input type="text" id="username" placeholder="e.g. MagnusCarlsen" />
+
+<p>Number of games to analyze:</p>
+<select id="gameCount">
+  <option value="100">100 games (faster)</option>
+  <option value="300" selected>300 games (balanced)</option>
+  <option value="500">500 games (slower)</option>
+</select>
+
+<p>Filter by game speed:</p>
+<select id="gameSpeed">
+  <option value="all" selected>All Speeds</option>
+  <option value="bullet">Bullet</option>
+  <option value="blitz">Blitz</option>
+  <option value="rapid">Rapid</option>
+  <option value="classical">Classical</option>
+  <option value="correspondence">Correspondence</option>
+</select>
+
+<br/><br/>
+<button onclick="analyze()">Analyze</button>
+
+<div id="loading"></div>
+<div id="results"></div>
+
+<script>
+function parsePGNHeaders(pgn) {
+  const headers = {};
+  const regex = /^\[(\w+)\s+"([^"]+)"\]/gm;
+  let match;
+  while ((match = regex.exec(pgn)) !== null) {
+    headers[match[1]] = match[2];
+  }
+  return headers;
+}
+
+async function analyze() {
+  const platform = document.getElementById('platform').value;
+  const username = document.getElementById('username').value.trim();
+  const gameCount = parseInt(document.getElementById('gameCount').value);
+  const gameSpeed = document.getElementById('gameSpeed').value; // Get selected speed
+  const loadingDiv = document.getElementById('loading');
+  const resultsDiv = document.getElementById('results');
+  resultsDiv.innerHTML = '';
+  loadingDiv.textContent = '';
+
+  if (!username) {
+    alert('Please enter a username.');
+    return;
+  }
+
+  loadingDiv.textContent = 'Loading games... this may take a few seconds.';
+
+  try {
+    if (platform === 'lichess') {
+      await analyzeLichess(username, gameCount, gameSpeed, resultsDiv); // Pass gameSpeed
+    } else {
+      await analyzeChessCom(username, gameCount, gameSpeed, resultsDiv); // Pass gameSpeed
+    }
+  } catch (e) {
+    loadingDiv.textContent = '';
+    resultsDiv.innerHTML = `<p style="color:red;">Error: ${e.message}</p>`;
+    return;
+  }
+
+  loadingDiv.textContent = '';
+}
+
+async function analyzeLichess(username, maxGames, gameSpeedFilter, resultsDiv) {
+  // Lichess API allows filtering by perf type directly, but let's fetch all and filter for simplicity
+  // If you want to optimize for very large numbers of games, you could add '&perfType=${gameSpeedFilter}'
+  // to the API call, but 'all' would still require fetching all.
+  const response = await fetch(`https://lichess.org/api/games/user/${username}?max=${maxGames}&opening=true`, {
+    headers: { 'Accept': 'application/x-ndjson' }
+  });
+  if (!response.ok) throw new Error('Error fetching Lichess games. Check username or try again.');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let { value, done } = await reader.read();
+  let buffer = "";
+
+  const whiteStats = {};
+  const blackStats = {};
+  const userLower = username.toLowerCase();
+  let gamesProcessed = 0; // Track games processed for filtering
+
+  while (!done) {
+    buffer += decoder.decode(value, { stream: true });
+    let lines = buffer.split('\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const game = JSON.parse(line);
+
+      // Lichess: Filter by game.speed
+      if (gameSpeedFilter !== 'all' && game.speed !== gameSpeedFilter) {
+        continue;
+      }
+
+      gamesProcessed++;
+      if (gamesProcessed > maxGames) break; // Limit total processed games after filtering
+
+      const opening = game.opening?.name || 'Unknown';
+      const whiteName = game.players.white.user.name.toLowerCase();
+      const blackName = game.players.black.user.name.toLowerCase();
+      const isWhite = whiteName === userLower;
+      const isBlack = blackName === userLower;
+
+      if (!isWhite && !isBlack) continue;
+
+      let result;
+      if (game.status === "draw") {
+        result = "draw";
+      } else if (game.winner === "white") {
+        result = isWhite ? "win" : "loss";
+      } else if (game.winner === "black") {
+        result = isBlack ? "win" : "loss";
+      } else {
+        result = "draw"; // Handle other statuses like "stalemate", "timeout" as draws for simplicity or refine as needed
+      }
+
+      const stats = isWhite ? whiteStats : blackStats;
+      if (!stats[opening]) stats[opening] = { win: 0, loss: 0, draw: 0, total: 0 };
+      stats[opening][result]++;
+      stats[opening].total++;
+    }
+    if (gamesProcessed > maxGames) break;
+    ({ value, done } = await reader.read());
+  }
+
+  displayStats(username, whiteStats, blackStats, resultsDiv);
+}
+
+async function analyzeChessCom(username, maxGames, gameSpeedFilter, resultsDiv) {
+  const archivesRes = await fetch(`https://api.chess.com/pub/player/${username}/games/archives`);
+  if (!archivesRes.ok) throw new Error('Chess.com user not found or API error.');
+  const archivesData = await archivesRes.json();
+
+  const whiteStats = {};
+  const blackStats = {};
+  const userLower = username.toLowerCase();
+
+  let games = [];
+  for (let i = archivesData.archives.length - 1; i >= 0; i--) {
+    if (games.length >= maxGames) break; // Stop fetching if we have enough games
+    const monthUrl = archivesData.archives[i];
+    const monthRes = await fetch(monthUrl);
+    if (!monthRes.ok) continue;
+    const monthData = await monthRes.json();
+    games = games.concat(monthData.games);
+  }
+
+  // Slice after fetching enough games, but before filtering by speed
+  // This ensures we have enough "raw" games to potentially meet the maxGames after speed filtering
+  games = games.slice(0, maxGames * 2); // Fetch more than `maxGames` initially to allow for filtering.
+                                      // The actual number of games processed will be `maxGames` or less.
+
+  let gamesProcessed = 0; // Track games processed after filtering
+
+  for (const game of games) {
+    const whiteName = (game.white.username || '').toLowerCase();
+    const blackName = (game.black.username || '').toLowerCase();
+    const isWhite = whiteName === userLower;
+    const isBlack = blackName === userLower;
+
+    if (!isWhite && !isBlack) continue;
+
+    // Chess.com: Filter by game.time_class
+    if (gameSpeedFilter !== 'all' && game.time_class !== gameSpeedFilter) {
+      continue;
+    }
+
+    gamesProcessed++;
+    if (gamesProcessed > maxGames) break; // Limit total processed games after filtering
+
+    let opening = 'Unknown';
+    if (game.pgn) {
+      const headers = parsePGNHeaders(game.pgn);
+      if (headers.Opening) opening = headers.Opening;
+      else if (headers.ECO) opening = headers.ECO;
+    }
+
+    let result = 'draw';
+    if (game.white.result === 'win' && isWhite) result = 'win';
+    else if (game.black.result === 'win' && isBlack) result = 'win';
+    else if ((game.white.result === 'win' && isBlack) || (game.black.result === 'win' && isWhite)) result = 'loss';
+    else if (game.white.result === 'draw' || game.black.result === 'draw') result = 'draw';
+
+
+    const stats = isWhite ? whiteStats : blackStats;
+    if (!stats[opening]) stats[opening] = { win: 0, loss: 0, draw: 0, total: 0 };
+    stats[opening][result]++;
+    stats[opening].total++;
+  }
+
+  displayStats(username, whiteStats, blackStats, resultsDiv);
+}
+
+function displayStats(username, whiteStats, blackStats, container) {
+  function generateTable(stats, title) {
+    let html = `<h2>${title}</h2><table><tr><th>Opening</th><th>Games</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win %</th></tr>`;
+    Object.entries(stats)
+      .sort((a, b) => b[1].total - a[1].total)
+      .forEach(([opening, s]) => {
+        const winPct = ((s.win / s.total) * 100).toFixed(1);
+        html += `<tr><td>${opening}</td><td>${s.total}</td><td>${s.win}</td><td>${s.loss}</td><td>${s.draw}</td><td>${winPct}%</td></tr>`;
+      });
+    html += `</table>`;
+    return html;
+  }
+
+  container.innerHTML = `
+    <h2>Results for ${username}</h2>
+    ${Object.keys(whiteStats).length > 0 ? generateTable(whiteStats, 'Openings as White') : '<p>No games as White found for the selected filter.</p>'}
+    ${Object.keys(blackStats).length > 0 ? generateTable(blackStats, 'Openings as Black') : '<p>No games as Black found for the selected filter.</p>'}
+  `;
+}
+</script>
+</body>
+</html>
